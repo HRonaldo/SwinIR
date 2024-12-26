@@ -5,11 +5,11 @@ import numpy as np
 from collections import OrderedDict
 import os
 import torch
-import requests
-
 from models.network_swinir import SwinIR as net
 from utils import util_calculate_psnr_ssim as util
+import warnings
 
+warnings.filterwarnings('ignore')
 
 def main():
     parser = argparse.ArgumentParser()
@@ -31,16 +31,12 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     # set up model
     if os.path.exists(args.model_path):
         print(f'loading model from {args.model_path}')
     else:
-        os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
-        url = 'https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/{}'.format(os.path.basename(args.model_path))
-        r = requests.get(url, allow_redirects=True)
-        print(f'downloading model {args.model_path}')
-        open(args.model_path, 'wb').write(r.content)
-
+        print(f'model {args.model_path} does not exist')
     model = define_model(args)
     model.eval()
     model = model.to(device)
@@ -49,59 +45,25 @@ def main():
     folder, save_dir, border, window_size = setup(args)
     os.makedirs(save_dir, exist_ok=True)
     test_results = OrderedDict()
-    test_results['psnr'] = []
-    test_results['ssim'] = []
-    test_results['psnr_y'] = []
-    test_results['ssim_y'] = []
-    test_results['psnrb'] = []
-    test_results['psnrb_y'] = []
-    psnr, ssim, psnr_y, ssim_y, psnrb, psnrb_y = 0, 0, 0, 0, 0, 0
+    metrics = ['psnr', 'ssim', 'psnr_y', 'ssim_y', 'psnrb', 'psnrb_y']
+    test_results = {metric: [] for metric in metrics}
 
     for idx, path in enumerate(sorted(glob.glob(os.path.join(folder, '*')))):
-        # read image
+        # 读取图片
         imgname, img_lq, img_gt = get_image_pair(args, path)  # image to HWC-BGR, float32
         img_lq = np.transpose(img_lq if img_lq.shape[2] == 1 else img_lq[:, :, [2, 1, 0]], (2, 0, 1))  # HCW-BGR to CHW-RGB
         img_lq = torch.from_numpy(img_lq).float().unsqueeze(0).to(device)  # CHW-RGB to NCHW-RGB
 
-        # inference
+        # 模型推理
         with torch.no_grad():
-            # pad input image to be a multiple of window_size
-            _, _, h_old, w_old = img_lq.size()
-            h_pad = (h_old // window_size + 1) * window_size - h_old
-            w_pad = (w_old // window_size + 1) * window_size - w_old
-            img_lq = torch.cat([img_lq, torch.flip(img_lq, [2])], 2)[:, :, :h_old + h_pad, :]
-            img_lq = torch.cat([img_lq, torch.flip(img_lq, [3])], 3)[:, :, :, :w_old + w_pad]
-            output = test(img_lq, model, args, window_size)
-            output = output[..., :h_old * args.scale, :w_old * args.scale]
+            output, h_old, w_old = perform_inference(img_lq, model, window_size, args.scale, args)
 
         # save image
-        output = output.data.squeeze().float().cpu().clamp_(0, 1).numpy()
-        if output.ndim == 3:
-            output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))  # CHW-RGB to HCW-BGR
-        output = (output * 255.0).round().astype(np.uint8)  # float32 to uint8
-        cv2.imwrite(f'{save_dir}/{imgname}_SwinIR.png', output)
+        output = save_image(output, save_dir, imgname)
 
         # evaluate psnr/ssim/psnr_b
         if img_gt is not None:
-            img_gt = (img_gt * 255.0).round().astype(np.uint8)  # float32 to uint8
-            img_gt = img_gt[:h_old * args.scale, :w_old * args.scale, ...]  # crop gt
-            img_gt = np.squeeze(img_gt)
-
-            psnr = util.calculate_psnr(output, img_gt, crop_border=border)
-            ssim = util.calculate_ssim(output, img_gt, crop_border=border)
-            test_results['psnr'].append(psnr)
-            test_results['ssim'].append(ssim)
-            if img_gt.ndim == 3:  # RGB image
-                psnr_y = util.calculate_psnr(output, img_gt, crop_border=border, test_y_channel=True)
-                ssim_y = util.calculate_ssim(output, img_gt, crop_border=border, test_y_channel=True)
-                test_results['psnr_y'].append(psnr_y)
-                test_results['ssim_y'].append(ssim_y)
-            if args.task in ['jpeg_car', 'color_jpeg_car']:
-                psnrb = util.calculate_psnrb(output, img_gt, crop_border=border, test_y_channel=False)
-                test_results['psnrb'].append(psnrb)
-                if args.task in ['color_jpeg_car']:
-                    psnrb_y = util.calculate_psnrb(output, img_gt, crop_border=border, test_y_channel=True)
-                    test_results['psnrb_y'].append(psnrb_y)
+            psnr, ssim, psnrb, psnr_y, ssim_y, psnrb_y = evaluate_image(output, img_gt, test_results, args, border, h_old, w_old)
             print('Testing {:d} {:20s} - PSNR: {:.2f} dB; SSIM: {:.4f}; PSNRB: {:.2f} dB;'
                   'PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}; PSNRB_Y: {:.2f} dB.'.
                   format(idx, imgname, psnr, ssim, psnrb, psnr_y, ssim_y, psnrb_y))
@@ -110,198 +72,281 @@ def main():
 
     # summarize psnr/ssim
     if img_gt is not None:
-        ave_psnr = sum(test_results['psnr']) / len(test_results['psnr'])
-        ave_ssim = sum(test_results['ssim']) / len(test_results['ssim'])
-        print('\n{} \n-- Average PSNR/SSIM(RGB): {:.2f} dB; {:.4f}'.format(save_dir, ave_psnr, ave_ssim))
-        if img_gt.ndim == 3:
-            ave_psnr_y = sum(test_results['psnr_y']) / len(test_results['psnr_y'])
-            ave_ssim_y = sum(test_results['ssim_y']) / len(test_results['ssim_y'])
-            print('-- Average PSNR_Y/SSIM_Y: {:.2f} dB; {:.4f}'.format(ave_psnr_y, ave_ssim_y))
-        if args.task in ['jpeg_car', 'color_jpeg_car']:
-            ave_psnrb = sum(test_results['psnrb']) / len(test_results['psnrb'])
-            print('-- Average PSNRB: {:.2f} dB'.format(ave_psnrb))
-            if args.task in ['color_jpeg_car']:
-                ave_psnrb_y = sum(test_results['psnrb_y']) / len(test_results['psnrb_y'])
-                print('-- Average PSNRB_Y: {:.2f} dB'.format(ave_psnrb_y))
+        summarize_results(test_results, img_gt, args, save_dir)
 
+def perform_inference(img_lq, model, window_size, scale, args):
+    """执行推理，确保图像尺寸与窗口大小对齐"""
+    _, _, h_old, w_old = img_lq.size()
+    h_pad = (h_old // window_size + 1) * window_size - h_old
+    w_pad = (w_old // window_size + 1) * window_size - w_old
+    img_lq = torch.cat([img_lq, torch.flip(img_lq, [2])], 2)[:, :, :h_old + h_pad, :]
+    img_lq = torch.cat([img_lq, torch.flip(img_lq, [3])], 3)[:, :, :, :w_old + w_pad]
+    output = test(img_lq, model, args, window_size)
+    return output[..., :h_old * scale, :w_old * scale], h_old, w_old
+
+def summarize_results(test_results, img_gt, args, save_dir):
+    """
+    计算并打印 PSNR、SSIM 及其他指标的平均值。
+    """
+    # 计算并打印 PSNR 和 SSIM 平均值
+    ave_psnr = sum(test_results['psnr']) / len(test_results['psnr'])
+    ave_ssim = sum(test_results['ssim']) / len(test_results['ssim'])
+    print(f'\n{save_dir} \n-- Average PSNR/SSIM(RGB): {ave_psnr:.2f} dB; {ave_ssim:.4f}')
+
+    # 如果是 RGB 图像，计算并打印 PSNR_Y 和 SSIM_Y 平均值
+    if img_gt.ndim == 3:
+        ave_psnr_y = sum(test_results['psnr_y']) / len(test_results['psnr_y'])
+        ave_ssim_y = sum(test_results['ssim_y']) / len(test_results['ssim_y'])
+        print(f'-- Average PSNR_Y/SSIM_Y: {ave_psnr_y:.2f} dB; {ave_ssim_y:.4f}')
+
+    # 如果任务是 JPEG 压缩伪影去除，计算并打印 PSNRB 平均值
+    if args.task in ['jpeg_car', 'color_jpeg_car']:
+        ave_psnrb = sum(test_results['psnrb']) / len(test_results['psnrb'])
+        print(f'-- Average PSNRB: {ave_psnrb:.2f} dB')
+
+        # 如果任务是 color_jpeg_car，计算并打印 PSNRB_Y 平均值
+        if args.task == 'color_jpeg_car':
+            ave_psnrb_y = sum(test_results['psnrb_y']) / len(test_results['psnrb_y'])
+            print(f'-- Average PSNRB_Y: {ave_psnrb_y:.2f} dB')
+
+
+def save_image(output, save_dir, imgname):
+    output = output.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+    if output.ndim == 3:
+        output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))
+    output = (output * 255.0).round().astype(np.uint8)
+    cv2.imwrite(f'{save_dir}/{imgname}_SwinIR.png', output)
+    return output
+
+def evaluate_image(output, img_gt, test_results, args, border, h_old, w_old):
+    img_gt = (img_gt * 255.0).round().astype(np.uint8)
+    img_gt = img_gt[:h_old * args.scale, :w_old * args.scale, ...]  # Crop GT to match output size
+    img_gt = np.squeeze(img_gt)
+    psnr = util.calculate_psnr(output, img_gt, crop_border=border)
+    ssim = util.calculate_ssim(output, img_gt, crop_border=border)
+    test_results['psnr'].append(psnr)
+    test_results['ssim'].append(ssim)
+    psnrb, psnr_y, ssim_y, psnrb_y = 0, 0, 0, 0
+    if img_gt.ndim == 3:  # RGB image
+        psnr_y = util.calculate_psnr(output, img_gt, crop_border=border, test_y_channel=True)
+        ssim_y = util.calculate_ssim(output, img_gt, crop_border=border, test_y_channel=True)
+        test_results['psnr_y'].append(psnr_y)
+        test_results['ssim_y'].append(ssim_y)
+    if args.task in ['jpeg_car', 'color_jpeg_car']:
+        psnrb = util.calculate_psnrb(output, img_gt, crop_border=border, test_y_channel=False)
+        test_results['psnrb'].append(psnrb)
+        if args.task == 'color_jpeg_car':  # 计算 Y 通道的 PSNRB
+            psnrb_y = util.calculate_psnrb(output, img_gt, crop_border=border, test_y_channel=True)
+            test_results['psnrb_y'].append(psnrb_y)
+    return psnr, ssim, psnrb, psnr_y, ssim_y, psnrb_y
 
 def define_model(args):
-    # 001 classical image sr
-    if args.task == 'classical_sr':
-        model = net(upscale=args.scale, in_chans=3, img_size=args.training_patch_size, window_size=8,
-                    img_range=1., depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
-                    mlp_ratio=2, upsampler='pixelshuffle', resi_connection='1conv')
-        param_key_g = 'params'
-
-    # 002 lightweight image sr
-    # use 'pixelshuffledirect' to save parameters
-    elif args.task == 'lightweight_sr':
-        model = net(upscale=args.scale, in_chans=3, img_size=64, window_size=8,
-                    img_range=1., depths=[6, 6, 6, 6], embed_dim=60, num_heads=[6, 6, 6, 6],
-                    mlp_ratio=2, upsampler='pixelshuffledirect', resi_connection='1conv')
-        param_key_g = 'params'
-
-    # 003 real-world image sr
-    elif args.task == 'real_sr':
-        if not args.large_model:
-            # use 'nearest+conv' to avoid block artifacts
-            model = net(upscale=args.scale, in_chans=3, img_size=64, window_size=8,
-                        img_range=1., depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
-                        mlp_ratio=2, upsampler='nearest+conv', resi_connection='1conv')
-        else:
-            # larger model size; use '3conv' to save parameters and memory; use ema for GAN training
-            model = net(upscale=args.scale, in_chans=3, img_size=64, window_size=8,
-                        img_range=1., depths=[6, 6, 6, 6, 6, 6, 6, 6, 6], embed_dim=240,
-                        num_heads=[8, 8, 8, 8, 8, 8, 8, 8, 8],
-                        mlp_ratio=2, upsampler='nearest+conv', resi_connection='3conv')
-        param_key_g = 'params_ema'
-
-    # 004 grayscale image denoising
-    elif args.task == 'gray_dn':
-        model = net(upscale=1, in_chans=1, img_size=128, window_size=8,
-                    img_range=1., depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
-                    mlp_ratio=2, upsampler='', resi_connection='1conv')
-        param_key_g = 'params'
-
-    # 005 color image denoising
-    elif args.task == 'color_dn':
-        model = net(upscale=1, in_chans=3, img_size=128, window_size=8,
-                    img_range=1., depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
-                    mlp_ratio=2, upsampler='', resi_connection='1conv')
-        param_key_g = 'params'
-
-    # 006 grayscale JPEG compression artifact reduction
-    # use window_size=7 because JPEG encoding uses 8x8; use img_range=255 because it's sligtly better than 1
-    elif args.task == 'jpeg_car':
-        model = net(upscale=1, in_chans=1, img_size=126, window_size=7,
-                    img_range=255., depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
-                    mlp_ratio=2, upsampler='', resi_connection='1conv')
-        param_key_g = 'params'
-
-    # 006 color JPEG compression artifact reduction
-    # use window_size=7 because JPEG encoding uses 8x8; use img_range=255 because it's sligtly better than 1
-    elif args.task == 'color_jpeg_car':
-        model = net(upscale=1, in_chans=3, img_size=126, window_size=7,
-                    img_range=255., depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
-                    mlp_ratio=2, upsampler='', resi_connection='1conv')
-        param_key_g = 'params'
-
+    task_config = {
+        'classical_sr': {
+            'upscale': args.scale, 'in_chans': 3, 'img_size': args.training_patch_size, 
+            'window_size': 8, 'img_range': 1., 'depths': [6]*6, 'embed_dim': 180, 
+            'num_heads': [6]*6, 'mlp_ratio': 2, 'upsampler': 'pixelshuffle', 'resi_connection': '1conv',
+            'param_key_g': 'params'
+        },
+        'lightweight_sr': {
+            'upscale': args.scale, 'in_chans': 3, 'img_size': 64, 
+            'window_size': 8, 'img_range': 1., 'depths': [6]*4, 'embed_dim': 60, 
+            'num_heads': [6]*4, 'mlp_ratio': 2, 'upsampler': 'pixelshuffledirect', 'resi_connection': '1conv',
+            'param_key_g': 'params'
+        },
+        'real_sr': {
+            'upscale': args.scale, 'in_chans': 3, 'img_size': 64, 
+            'window_size': 8, 'img_range': 1., 'depths': [6]*9 if args.large_model else [6]*6, 
+            'embed_dim': 240 if args.large_model else 180, 
+            'num_heads': [8]*9 if args.large_model else [6]*6, 'mlp_ratio': 2, 
+            'upsampler': 'nearest+conv', 'resi_connection': '3conv' if args.large_model else '1conv',
+            'param_key_g': 'params_ema' if args.large_model else 'params'
+        },
+        'gray_dn': {
+            'upscale': 1, 'in_chans': 1, 'img_size': 128, 
+            'window_size': 8, 'img_range': 1., 'depths': [6]*6, 'embed_dim': 180, 
+            'num_heads': [6]*6, 'mlp_ratio': 2, 'upsampler': '', 'resi_connection': '1conv',
+            'param_key_g': 'params'
+        },
+        'color_dn': {
+            'upscale': 1, 'in_chans': 3, 'img_size': 128, 
+            'window_size': 8, 'img_range': 1., 'depths': [6]*6, 'embed_dim': 180, 
+            'num_heads': [6]*6, 'mlp_ratio': 2, 'upsampler': '', 'resi_connection': '1conv',
+            'param_key_g': 'params'
+        },
+        'jpeg_car': {
+            'upscale': 1, 'in_chans': 1, 'img_size': 126, 
+            'window_size': 7, 'img_range': 255., 'depths': [6]*6, 'embed_dim': 180, 
+            'num_heads': [6]*6, 'mlp_ratio': 2, 'upsampler': '', 'resi_connection': '1conv',
+            'param_key_g': 'params'
+        },
+        'color_jpeg_car': {
+            'upscale': 1, 'in_chans': 3, 'img_size': 126, 
+            'window_size': 7, 'img_range': 255., 'depths': [6]*6, 'embed_dim': 180, 
+            'num_heads': [6]*6, 'mlp_ratio': 2, 'upsampler': '', 'resi_connection': '1conv',
+            'param_key_g': 'params'
+        }
+    }
+    
+    if args.task not in task_config:
+        raise ValueError(f"Unsupported task: {args.task}")
+    config = task_config[args.task]
+    param_key_g = config.pop('param_key_g')
+    model = net(**config)
     pretrained_model = torch.load(args.model_path)
-    model.load_state_dict(pretrained_model[param_key_g] if param_key_g in pretrained_model.keys() else pretrained_model, strict=True)
+    model.load_state_dict(pretrained_model.get(param_key_g, pretrained_model), strict=True)
 
     return model
 
 
 def setup(args):
-    # 001 classical image sr/ 002 lightweight image sr
-    if args.task in ['classical_sr', 'lightweight_sr']:
-        save_dir = f'results/swinir_{args.task}_x{args.scale}'
-        folder = args.folder_gt
-        border = args.scale
-        window_size = 8
+    # 默认配置表
+    task_configs = {
+        'classical_sr': {
+            'save_dir': f'results/swinir_classical_sr_x{args.scale}',
+            'folder': args.folder_gt,
+            'border': args.scale,
+            'window_size': 8
+        },
+        'lightweight_sr': {
+            'save_dir': f'results/swinir_lightweight_sr_x{args.scale}',
+            'folder': args.folder_gt,
+            'border': args.scale,
+            'window_size': 8
+        },
+        'real_sr': {
+            'save_dir': f'results/swinir_real_sr_x{args.scale}' + ('_large' if args.large_model else ''),
+            'folder': args.folder_lq,
+            'border': 0,
+            'window_size': 8
+        },
+        'gray_dn': {
+            'save_dir': f'results/swinir_gray_dn_noise{args.noise}',
+            'folder': args.folder_gt,
+            'border': 0,
+            'window_size': 8
+        },
+        'color_dn': {
+            'save_dir': f'results/swinir_color_dn_noise{args.noise}',
+            'folder': args.folder_gt,
+            'border': 0,
+            'window_size': 8
+        },
+        'jpeg_car': {
+            'save_dir': f'results/swinir_jpeg_car_jpeg{args.jpeg}',
+            'folder': args.folder_gt,
+            'border': 0,
+            'window_size': 7
+        },
+        'color_jpeg_car': {
+            'save_dir': f'results/swinir_color_jpeg_car_jpeg{args.jpeg}',
+            'folder': args.folder_gt,
+            'border': 0,
+            'window_size': 7
+        }
+    }
 
-    # 003 real-world image sr
-    elif args.task in ['real_sr']:
-        save_dir = f'results/swinir_{args.task}_x{args.scale}'
-        if args.large_model:
-            save_dir += '_large'
-        folder = args.folder_lq
-        border = 0
-        window_size = 8
+    # 检查任务是否有效
+    if args.task not in task_configs:
+        raise ValueError(f"Invalid task: {args.task}. Supported tasks: {list(task_configs.keys())}")
 
-    # 004 grayscale image denoising/ 005 color image denoising
-    elif args.task in ['gray_dn', 'color_dn']:
-        save_dir = f'results/swinir_{args.task}_noise{args.noise}'
-        folder = args.folder_gt
-        border = 0
-        window_size = 8
-
-    # 006 JPEG compression artifact reduction
-    elif args.task in ['jpeg_car', 'color_jpeg_car']:
-        save_dir = f'results/swinir_{args.task}_jpeg{args.jpeg}'
-        folder = args.folder_gt
-        border = 0
-        window_size = 7
+    # 从配置表中提取参数
+    config = task_configs[args.task]
+    folder = config['folder']
+    save_dir = config['save_dir']
+    border = config['border']
+    window_size = config['window_size']
 
     return folder, save_dir, border, window_size
 
 
+
 def get_image_pair(args, path):
-    (imgname, imgext) = os.path.splitext(os.path.basename(path))
+    def read_image(filepath, mode=cv2.IMREAD_COLOR):
+        img = cv2.imread(filepath, mode)
+        if img is None:
+            raise FileNotFoundError(f"Image file not found: {filepath}")
+        return img.astype(np.float32) / 255.
 
-    # 001 classical image sr/ 002 lightweight image sr (load lq-gt image pairs)
+    def add_noise(image, noise_level):
+        np.random.seed(0)
+        noise = np.random.normal(0, noise_level / 255., image.shape)
+        return image + noise
+
+    imgname, imgext = os.path.splitext(os.path.basename(path))
+    img_gt, img_lq = None, None
+
     if args.task in ['classical_sr', 'lightweight_sr']:
-        img_gt = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.
-        img_lq = cv2.imread(f'{args.folder_lq}/{imgname}x{args.scale}{imgext}', cv2.IMREAD_COLOR).astype(
-            np.float32) / 255.
+        img_gt = read_image(path)
+        lq_path = f'{args.folder_lq}/{imgname}x{args.scale}{imgext}'
+        img_lq = read_image(lq_path)
 
-    # 003 real-world image sr (load lq image only)
-    elif args.task in ['real_sr']:
-        img_gt = None
-        img_lq = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.
+    elif args.task == 'real_sr':
+        img_lq = read_image(path)
 
-    # 004 grayscale image denoising (load gt image and generate lq image on-the-fly)
-    elif args.task in ['gray_dn']:
-        img_gt = cv2.imread(path, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.
-        np.random.seed(seed=0)
-        img_lq = img_gt + np.random.normal(0, args.noise / 255., img_gt.shape)
+    elif args.task == 'gray_dn':
+        img_gt = read_image(path, mode=cv2.IMREAD_GRAYSCALE)
+        img_lq = add_noise(img_gt, args.noise)
         img_gt = np.expand_dims(img_gt, axis=2)
         img_lq = np.expand_dims(img_lq, axis=2)
 
-    # 005 color image denoising (load gt image and generate lq image on-the-fly)
-    elif args.task in ['color_dn']:
-        img_gt = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.
-        np.random.seed(seed=0)
-        img_lq = img_gt + np.random.normal(0, args.noise / 255., img_gt.shape)
+    elif args.task == 'color_dn':
+        img_gt = read_image(path)
+        img_lq = add_noise(img_gt, args.noise)
 
-    # 006 grayscale JPEG compression artifact reduction (load gt image and generate lq image on-the-fly)
-    elif args.task in ['jpeg_car']:
+    elif args.task == 'jpeg_car':
         img_gt = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if img_gt.ndim != 2:
             img_gt = util.bgr2ycbcr(img_gt, y_only=True)
-        result, encimg = cv2.imencode('.jpg', img_gt, [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg])
-        img_lq = cv2.imdecode(encimg, 0)
-        img_gt = np.expand_dims(img_gt, axis=2).astype(np.float32) / 255.
-        img_lq = np.expand_dims(img_lq, axis=2).astype(np.float32) / 255.
+        _, encimg = cv2.imencode('.jpg', img_gt, [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg])
+        img_lq = cv2.imdecode(encimg, cv2.IMREAD_UNCHANGED)
+        img_gt = np.expand_dims(img_gt.astype(np.float32) / 255., axis=2)
+        img_lq = np.expand_dims(img_lq.astype(np.float32) / 255., axis=2)
 
-    # 006 JPEG compression artifact reduction (load gt image and generate lq image on-the-fly)
-    elif args.task in ['color_jpeg_car']:
-        img_gt = cv2.imread(path)
-        result, encimg = cv2.imencode('.jpg', img_gt, [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg])
-        img_lq = cv2.imdecode(encimg, 1)
-        img_gt = img_gt.astype(np.float32)/ 255.
-        img_lq = img_lq.astype(np.float32)/ 255.
+    elif args.task == 'color_jpeg_car':
+        img_gt = read_image(path)
+        _, encimg = cv2.imencode('.jpg', img_gt * 255., [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg])
+        img_lq = cv2.imdecode(encimg, cv2.IMREAD_COLOR).astype(np.float32) / 255.
+
+    else:
+        raise ValueError(f"Unsupported task: {args.task}")
 
     return imgname, img_lq, img_gt
 
 
 def test(img_lq, model, args, window_size):
+    def check_tile_size(tile, window_size):
+        if tile % window_size != 0:
+            raise ValueError("Tile size should be a multiple of window_size")
     if args.tile is None:
-        # test the image as a whole
         output = model(img_lq)
     else:
-        # test the image tile by tile
         b, c, h, w = img_lq.size()
         tile = min(args.tile, h, w)
-        assert tile % window_size == 0, "tile size should be a multiple of window_size"
+        check_tile_size(tile, window_size)
         tile_overlap = args.tile_overlap
-        sf = args.scale
+        scale = args.scale
 
         stride = tile - tile_overlap
-        h_idx_list = list(range(0, h-tile, stride)) + [h-tile]
-        w_idx_list = list(range(0, w-tile, stride)) + [w-tile]
-        E = torch.zeros(b, c, h*sf, w*sf).type_as(img_lq)
+        h_idx_list = list(range(0, h - tile, stride)) + [h - tile]
+        w_idx_list = list(range(0, w - tile, stride)) + [w - tile]
+
+        E = torch.zeros(b, c, h * scale, w * scale, device=img_lq.device)
         W = torch.zeros_like(E)
 
         for h_idx in h_idx_list:
             for w_idx in w_idx_list:
-                in_patch = img_lq[..., h_idx:h_idx+tile, w_idx:w_idx+tile]
-                out_patch = model(in_patch)
-                out_patch_mask = torch.ones_like(out_patch)
+                in_patch = img_lq[..., h_idx:h_idx + tile, w_idx:w_idx + tile]
 
-                E[..., h_idx*sf:(h_idx+tile)*sf, w_idx*sf:(w_idx+tile)*sf].add_(out_patch)
-                W[..., h_idx*sf:(h_idx+tile)*sf, w_idx*sf:(w_idx+tile)*sf].add_(out_patch_mask)
-        output = E.div_(W)
+                out_patch = model(in_patch)
+
+                h_start, h_end = h_idx * scale, (h_idx + tile) * scale
+                w_start, w_end = w_idx * scale, (w_idx + tile) * scale
+
+                E[..., h_start:h_end, w_start:w_end] += out_patch
+                W[..., h_start:h_end, w_start:w_end] += 1
+
+        output = E / W
 
     return output
 
